@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { transcribeFile } from '@/lib/assemblyai'
-import { isYoutubeUrl, downloadYoutubeAudio } from '@/lib/youtube'
+import { isYoutubeUrl, getYoutubeTranscript } from '@/lib/youtube'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300 // 5分
@@ -15,12 +15,10 @@ export async function POST(req: NextRequest) {
 
     if (audioUrl) {
       if (isYoutubeUrl(audioUrl)) {
-        // YouTube: 外部API(RapidAPI)でmp3を取得 → 自前DL → AssemblyAIにアップロード
-        // （配信ホストはAssemblyAIから直接取得できないため、サーバー経由で渡す）
-        const buffer = await downloadYoutubeAudio(audioUrl)
-        const { AssemblyAI } = await import('assemblyai')
-        const client = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY! })
-        audioSource = await client.files.upload(buffer)
+        // YouTube: Supadataで文字起こしテキストを直接取得して即返却（AssemblyAI不要）。
+        // 取得はSupadata側で行うため、実行環境(Vercel)のIPに依存せず本番でも動作する。
+        const text = await getYoutubeTranscript(audioUrl)
+        return NextResponse.json({ text })
       } else {
         // 直接の音声ファイルURL
         audioSource = audioUrl
