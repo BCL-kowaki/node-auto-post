@@ -1,94 +1,98 @@
-import { spawn } from 'child_process'
-import { mkdtemp, readdir, readFile, rm } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join } from 'path'
-
-// yt-dlp の実行パス（環境変数で上書き可能。デフォルトはPATH解決）
-const YT_DLP = process.env.YT_DLP_PATH || 'yt-dlp'
-
 // YouTube URL 判定（youtube.com / youtu.be）
 export function isYoutubeUrl(url: string): boolean {
   return /(?:youtube\.com\/|youtu\.be\/)/i.test(url)
 }
 
-interface ExtractedAudio {
-  buffer: Buffer
-  ext: string
+// URL から動画ID（11文字）を抽出
+function extractVideoId(url: string): string | null {
+  const m = url.match(/(?:v=|youtu\.be\/|\/embed\/|\/shorts\/|\/live\/)([\w-]{11})/)
+  return m ? m[1] : null
+}
+
+const RAPIDAPI_HOST = 'youtube-mp36.p.rapidapi.com'
+
+/**
+ * 外部API（RapidAPI: youtube-mp36）でYouTube動画から音声(mp3)の公開URLを取得する。
+ * yt-dlpのようなシステムバイナリ不要のため、Vercel等のサーバーレス環境でも動作する。
+ *
+ * youtube-mp36 は非同期変換のため、status が "ok" になるまでポーリングする。
+ * 返すURLは公開アクセス可能なmp3リンクで、そのままAssemblyAIに渡して文字起こしできる。
+ */
+async function getYoutubeAudioUrl(url: string): Promise<string> {
+  const videoId = extractVideoId(url)
+  if (!videoId) {
+    throw new Error('有効なYouTube URLではありません')
+  }
+
+  const apiKey = process.env.RAPIDAPI_KEY
+  if (!apiKey) {
+    throw new Error(
+      'RAPIDAPI_KEY が未設定です。YouTube音声抽出APIのキーを環境変数に設定してください。'
+    )
+  }
+
+  const headers = {
+    'x-rapidapi-key': apiKey,
+    'x-rapidapi-host': RAPIDAPI_HOST,
+  }
+
+  // 変換完了までポーリング（最大 ~60秒）
+  const maxAttempts = 20
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await fetch(
+      `https://${RAPIDAPI_HOST}/dl?id=${encodeURIComponent(videoId)}`,
+      { headers }
+    )
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        throw new Error('YouTube音声抽出APIの認証に失敗しました（RAPIDAPI_KEYを確認してください）')
+      }
+      if (res.status === 429) {
+        throw new Error('YouTube音声抽出APIのレート上限に達しました（プランをご確認ください）')
+      }
+      throw new Error(`YouTube音声抽出APIエラー: HTTP ${res.status}`)
+    }
+
+    const data: { status?: string; link?: string; msg?: string } = await res.json()
+
+    if (data.status === 'ok' && data.link) {
+      return data.link
+    }
+    if (data.status === 'fail') {
+      throw new Error(`YouTube音声抽出に失敗しました: ${data.msg ?? '不明なエラー'}`)
+    }
+
+    // status が "processing" 等 → 少し待って再試行
+    await new Promise((r) => setTimeout(r, 3000))
+  }
+
+  throw new Error('YouTube音声抽出がタイムアウトしました（変換に時間がかかりすぎています）')
 }
 
 /**
- * yt-dlp で YouTube から音声を抽出して Buffer で返す。
- * ※ サーバー（Vercel等）には yt-dlp を導入できないため、ローカル開発限定。
+ * YouTube動画の音声(mp3)をサーバー側でダウンロードして Buffer で返す。
+ * 外部APIが返すmp3ホストはAssemblyAIから直接取得できない場合があるため、
+ * 自前でダウンロードして AssemblyAI へアップロードする。
  */
-export async function extractYoutubeAudio(url: string): Promise<ExtractedAudio> {
-  const dir = await mkdtemp(join(tmpdir(), 'ytdlp-'))
-  try {
-    const outTemplate = join(dir, 'audio.%(ext)s')
-    // bestaudio をネイティブコンテナ（m4a/webm等）のまま取得 → AssemblyAIが対応
-    await runYtDlp([
-      '-f',
-      'bestaudio/best',
-      '--no-playlist',
-      '--no-warnings',
-      '-o',
-      outTemplate,
-      url,
-    ])
+export async function downloadYoutubeAudio(url: string): Promise<Buffer> {
+  const mp3Url = await getYoutubeAudioUrl(url)
 
-    const files = await readdir(dir)
-    const audioFile = files.find((f) => f.startsWith('audio.'))
-    if (!audioFile) {
-      throw new Error('音声ファイルの抽出に失敗しました（出力が見つかりません）')
-    }
-
-    const buffer = await readFile(join(dir, audioFile))
-    const ext = audioFile.split('.').pop() ?? 'm4a'
-    return { buffer, ext }
-  } finally {
-    // 一時ディレクトリを必ず削除
-    await rm(dir, { recursive: true, force: true })
-  }
-}
-
-function runYtDlp(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // dev サーバーの PATH に Homebrew 等が含まれない場合があるため明示的に補う
-    // （yt-dlp が ffmpeg を呼ぶ場合にも有効）
-    const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin']
-    const proc = spawn(YT_DLP, args, {
-      env: {
-        ...process.env,
-        PATH: [process.env.PATH, ...extraPaths].filter(Boolean).join(':'),
-      },
-    })
-    let stderr = ''
-
-    proc.stderr.on('data', (d: Buffer) => {
-      stderr += d.toString()
-    })
-
-    proc.on('error', (e: NodeJS.ErrnoException) => {
-      if (e.code === 'ENOENT') {
-        reject(
-          new Error(
-            'yt-dlp が見つかりません。`brew install yt-dlp` でインストールしてください（YouTube処理はローカル開発限定）。'
-          )
-        )
-      } else {
-        reject(new Error(`yt-dlp の起動に失敗しました: ${e.message}`))
-      }
-    })
-
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve()
-      } else {
-        reject(
-          new Error(
-            `YouTube音声の抽出に失敗しました: ${stderr.slice(-400) || `exit code ${code}`}`
-          )
-        )
-      }
-    })
+  const res = await fetch(mp3Url, {
+    headers: {
+      // 一部の配信ホストはブラウザUA以外を弾くため付与
+      'user-agent':
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    },
   })
+
+  if (!res.ok) {
+    throw new Error(`YouTube音声のダウンロードに失敗しました: HTTP ${res.status}`)
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer())
+  if (buffer.length === 0) {
+    throw new Error('YouTube音声を取得できませんでした（空のデータ）')
+  }
+  return buffer
 }

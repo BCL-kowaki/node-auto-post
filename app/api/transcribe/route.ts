@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { transcribeFile } from '@/lib/assemblyai'
-import { isYoutubeUrl, extractYoutubeAudio } from '@/lib/youtube'
+import { isYoutubeUrl, downloadYoutubeAudio } from '@/lib/youtube'
 
-export const runtime = 'nodejs' // child_process（yt-dlp）を使うためNode.jsランタイム必須
+export const runtime = 'nodejs'
 export const maxDuration = 300 // 5分
 
 export async function POST(req: NextRequest) {
@@ -15,8 +15,9 @@ export async function POST(req: NextRequest) {
 
     if (audioUrl) {
       if (isYoutubeUrl(audioUrl)) {
-        // YouTube: yt-dlpで音声抽出 → AssemblyAIにアップロード（ローカル開発限定）
-        const { buffer } = await extractYoutubeAudio(audioUrl)
+        // YouTube: 外部API(RapidAPI)でmp3を取得 → 自前DL → AssemblyAIにアップロード
+        // （配信ホストはAssemblyAIから直接取得できないため、サーバー経由で渡す）
+        const buffer = await downloadYoutubeAudio(audioUrl)
         const { AssemblyAI } = await import('assemblyai')
         const client = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY! })
         audioSource = await client.files.upload(buffer)
