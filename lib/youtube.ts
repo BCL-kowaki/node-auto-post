@@ -52,7 +52,15 @@ export async function extractYoutubeAudio(url: string): Promise<ExtractedAudio> 
 
 function runYtDlp(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(YT_DLP, args)
+    // dev サーバーの PATH に Homebrew 等が含まれない場合があるため明示的に補う
+    // （yt-dlp が ffmpeg を呼ぶ場合にも有効）
+    const extraPaths = ['/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin']
+    const proc = spawn(YT_DLP, args, {
+      env: {
+        ...process.env,
+        PATH: [process.env.PATH, ...extraPaths].filter(Boolean).join(':'),
+      },
+    })
     let stderr = ''
 
     proc.stderr.on('data', (d: Buffer) => {
